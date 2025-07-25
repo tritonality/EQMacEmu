@@ -66,6 +66,7 @@ public:
 					uint32 ls_account_id, uint32 from_id, 
 					const char* ip_str, const char* forum_name, const char* client_key = nullptr);
 	void RemoveFromQueue(const std::vector<uint32>& account_ids);
+	void RemoveFromQueue(const std::vector<uint32>& account_ids, bool skip_database); // With database skip option
 	void RemoveFromQueue(uint32 account_id) { RemoveFromQueue(std::vector<uint32>{account_id}); } // Single account overload
 	void UpdateQueuePositions();
 	
@@ -98,8 +99,7 @@ public:
 	/**
 	 * Persistence operations
 	 */
-	// void SyncQueueToDatabase();
-	void RestoreQueueFromDatabase();
+	void SyncQueueFromDatabase();
 	void CheckForExternalChanges(); // NEW: Check if database changed externally
 
 	void ProcessAdvancementTimer(); // Enhanced queue management - handles population updates, DB sync, and advancement

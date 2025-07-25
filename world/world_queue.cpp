@@ -105,7 +105,9 @@ void QueueManager::AddToQueue(uint32 world_account_id, uint32 position, uint32 e
 	
 }
 
-void QueueManager::RemoveFromQueue(const std::vector<uint32>& account_ids)
+void QueueManager::RemoveFromQueue(const std::vector<uint32>& account_ids){RemoveFromQueue(account_ids, false); /* Call with skip_database = false (normal behavior) */}
+
+void QueueManager::RemoveFromQueue(const std::vector<uint32>& account_ids, bool skip_database)
 {
 	if (account_ids.empty()) {
 		return;
@@ -154,8 +156,10 @@ void QueueManager::RemoveFromQueue(const std::vector<uint32>& account_ids)
 		return;
 	}
 	
-	for (uint32 account_id : removed_accounts) {
-		RemoveQueueDBEntry(account_id); 
+	if (!skip_database) {
+		for (uint32 account_id : removed_accounts) {
+			RemoveQueueDBEntry(account_id); 
+		}
 	}
 	
 	if (loginserver && loginserver->Connected()) {
@@ -457,7 +461,7 @@ void QueueManager::CheckForExternalChanges() // Handles test offset changes and 
 			
 			if (should_refresh) {
 				QueueDebugLog(1, "Queue refresh flag detected - refreshing queue from database");
-				RestoreQueueFromDatabase();
+				SyncQueueFromDatabase();
 				QueueDebugLog(1, "Queue refreshed from database - clients updated");
 			} else {
 				QueueDebugLog(2, "RefreshQueue flag value = '{}' - resetting to 0", flag_value);
@@ -814,78 +818,41 @@ void QueueManager::ProcessAdvancementTimer()
 	CheckForExternalChanges();
 }
 
-void QueueManager::RestoreQueueFromDatabase()
+void QueueManager::SyncQueueFromDatabase()
 {
-	// Check if queue persistence is enabled
-	if (!RuleB(Quarm, EnableQueuePersistence)) {
-		QueueDebugLog(2, "Queue persistence disabled - clearing old queue entries for world server [{}]", m_world_server_id);
-		auto clear_query = fmt::format("DELETE FROM tblLoginQueue WHERE world_server_id = {}", m_world_server_id);
-		database.QueryDatabase(clear_query);  // Use global database
+	// Load current database queue entries
+	std::vector<std::tuple<uint32, uint32, uint32, uint32>> db_queue_entries;
+	if (!LoadQueueEntries(db_queue_entries)) {
+		QueueDebugLog(2, "SyncQueueFromDatabase: Failed to load queue entries from database");
 		return;
 	}
 	
-	QueueDebugLog(1, "Restoring queue from database for world server [{}]", m_world_server_id);
-	
-	// Load queue entries from database
-	std::vector<std::tuple<uint32, uint32, uint32, uint32>> queue_entries;
-	if (!LoadQueueEntries(queue_entries)) {
-		LogError("Failed to load queue entries from database");
-		return;
+	// Create a set of account IDs that exist in database for fast lookup
+	std::set<uint32> db_account_ids;
+	for (const auto& entry : db_queue_entries) {
+		uint32 account_id = std::get<0>(entry);
+		db_account_ids.insert(account_id);
 	}
 	
-	// Restore queue entries to memory
-	m_queued_clients.clear();
-	uint32 restored_count = 0;
-	
-	for (const auto& entry_tuple : queue_entries) {
-		uint32 world_account_id = std::get<0>(entry_tuple);  
-		uint32 queue_position = std::get<1>(entry_tuple);
-		uint32 estimated_wait = std::get<2>(entry_tuple);
-		uint32 ip_address = std::get<3>(entry_tuple);
-		
-		// Skip entries with invalid world account IDs
-		if (world_account_id == 0) {
-			QueueDebugLog(2, "QueueManager - SKIP: Invalid world account ID [0] during restoration");
-			continue;
+	// Find accounts that are in memory but not in database (removed externally)
+	std::vector<uint32> accounts_to_remove;
+	for (const auto& qclient : m_queued_clients) {
+		if (db_account_ids.find(qclient.w_accountid) == db_account_ids.end()) {
+			// Account is in memory but not in database - was removed externally
+			accounts_to_remove.push_back(qclient.w_accountid);
 		}
-		
-		QueuedClient entry;
-		entry.w_accountid = world_account_id;
-		entry.queue_position = queue_position;
-		entry.estimated_wait = estimated_wait;
-		entry.ip_address = ip_address;
-		entry.queued_timestamp = time(nullptr); // Current time for restored entries
-		entry.last_updated = time(nullptr);
-		
-		// For restored entries, we don't have LS account ID or extended connection details
-		entry.ls_account_id = 0; // Unknown for restored entries
-		entry.from_id = 0;
-		entry.ip_str = "";
-		entry.forum_name = "";
-		
-		// Use vector push_back instead of map indexing (consistent with vector declaration)
-		m_queued_clients.push_back(entry);
-		restored_count++;
-		
-		QueueDebugLog(2, "QueueManager - RESTORE: World account [{}] at position [{}] with wait [{}] - persistent queue entry restored", 
-			world_account_id, queue_position, estimated_wait);
 	}
 	
-	if (restored_count > 0) {
-		QueueDebugLog(1, "Restored [{}] persistent queue entries from database for world server [{}]", 
-			restored_count, m_world_server_id);
-		QueueDebugLog(2, "NOTE: Restored entries use world account IDs only - LS account mapping will be established when players reconnect");
+	if (!accounts_to_remove.empty()) {
+		QueueDebugLog(1, "SyncQueueFromDatabase: Found [{}] accounts removed externally from database", accounts_to_remove.size());
+		
+		// Remove from memory only (skip database since they're already gone)
+		RemoveFromQueue(accounts_to_remove, true); // skip_database = true
+		
+		QueueDebugLog(1, "SyncQueueFromDatabase: Synced memory queue with database - removed [{}] externally deleted accounts", 
+			accounts_to_remove.size());
 	} else {
-		QueueDebugLog(2, "No queue entries to restore for world server [{}]", m_world_server_id);
-	}
-	
-	// Send immediate update to login server after queue restore
-	if (loginserver && loginserver->Connected()) {
-		uint32 effective_population = EffectivePopulation();
-		SendWorldListUpdate(effective_population);
-		QueueDebugLog(1, "Sent ServerOP_WorldListUpdate to login server after queue restore - population: {}", effective_population);
-	} else {
-		QueueDebugLog(1, "Login server not connected - cannot send queue restore update");
+		QueueDebugLog(2, "SyncQueueFromDatabase: Memory queue is in sync with database");
 	}
 }
 
